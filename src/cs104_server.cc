@@ -144,7 +144,6 @@ Napi::Value IEC104Server::Start(const Napi::CallbackInfo& info) {
             return env.Undefined();
         }
     }
-
     
 
     int originatorAddress = 1;
