@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <inttypes.h> // Для PRIu64
+#include <chrono>
 #include "cs104_server.h"
 
 using namespace Napi;
@@ -250,7 +251,7 @@ Napi::Value IEC104Server::Start(const Napi::CallbackInfo& info) {
             fflush(stdout);
 
          while (running) {
-                Thread_sleep(100);
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
             }
 
             // Thread cleanup: only stop server, do not destroy
@@ -1541,6 +1542,30 @@ Napi::Value IEC104Server::GetStatus(const Napi::CallbackInfo& info) {
     status.Set("connectedClients", clients);
 
     return status;
+}
+
+void IEC104Server::startTimeoutTimer(const PendingCommandKey& key, std::shared_ptr<PendingCommand> pending, uint64_t timeoutMs) {
+    // Запускаем таймер в отдельном потоке
+    std::thread([this, key, pending, timeoutMs]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
+        std::lock_guard<std::mutex> lock(pendingMutex);
+        auto it = pendingCommands.find(key);
+        if (it != pendingCommands.end() && it->second == pending) {
+            bool alreadyResolved = false;
+            {
+                std::lock_guard<std::mutex> lock(pending->mtx);
+                if (!pending->resolved) {
+                    pending->resolved = true;
+                } else {
+                    alreadyResolved = true;
+                }
+            }
+            if (!alreadyResolved) {
+                pendingCommands.erase(it);
+                pending->deferred.Reject(Napi::String::New(pending->deferred.Env(), "Command timeout"));
+            }
+        }
+    }).detach();
 }
 
 /*bool IEC104Server::RawMessageHandler(void* parameter, IMasterConnection connection, CS101_ASDU asdu) {
