@@ -29,7 +29,7 @@ Napi::Object IEC104Server::Init(Napi::Env env, Napi::Object exports) {
         InstanceMethod("start", &IEC104Server::Start),
         InstanceMethod("stop", &IEC104Server::Stop),
         InstanceMethod("sendCommands", &IEC104Server::SendCommands),
-        InstanceMethod("sendCommandAsync", &IEC104Server::SendCommandAsync),
+        InstanceMethod("sendCommandsAsync", &IEC104Server::SendCommandsAsync),
         InstanceMethod("getStatus", &IEC104Server::GetStatus)
     });
 
@@ -1426,30 +1426,20 @@ static void destroyInformationObject(int typeId, InformationObject io) {
     }
 }
 
-Napi::Value IEC104Server::SendCommandAsync(const Napi::CallbackInfo& info) {
+/*Napi::Value IEC104Server::SendCommandsAsync(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
 
-    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsObject()) {
-        Napi::TypeError::New(env, "Expected clientId (string) and command object").ThrowAsJavaScriptException();
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsArray()) {
+        Napi::TypeError::New(env, "Expected clientId (string), commands (array)").ThrowAsJavaScriptException();
         return env.Undefined();
     }
 
     std::string clientIdStr = info[0].As<Napi::String>().Utf8Value();
-    Napi::Object cmdObj = info[1].As<Napi::Object>();
+    Napi::Array commands = info[1].As<Napi::Array>();
     uint64_t timeoutMs = 5000;
     if (info.Length() >= 3 && info[2].IsNumber()) {
         timeoutMs = info[2].As<Napi::Number>().Int64Value();
     }
-
-    // Валидация полей
-    if (!cmdObj.Has("typeId") || !cmdObj.Has("ioa") || !cmdObj.Has("value") || !cmdObj.Has("asduAddress")) {
-        Napi::TypeError::New(env, "Command must have 'typeId', 'ioa', 'value', 'asduAddress'").ThrowAsJavaScriptException();
-        return env.Undefined();
-    }
-
-    int typeId = cmdObj.Get("typeId").As<Napi::Number>().Int32Value();
-    int ioa = cmdObj.Get("ioa").As<Napi::Number>().Int32Value();
-    int asduAddress = cmdObj.Get("asduAddress").As<Napi::Number>().Int32Value();
 
     // Получаем соединение
     IMasterConnection targetConnection = nullptr;
@@ -1467,64 +1457,256 @@ Napi::Value IEC104Server::SendCommandAsync(const Napi::CallbackInfo& info) {
         return env.Undefined();
     }
 
-    // Генерируем ключ
-    PendingCommandKey key{clientIdStr, ioa, typeId, asduAddress};
+    // Группировка команд по (typeId, asduAddress)
+    std::map<std::pair<int, int>, std::vector<Napi::Object>> groupedCommands;
+    for (uint32_t i = 0; i < commands.Length(); i++) {
+        Napi::Value item = commands[i];
+        if (!item.IsObject()) {
+            Napi::TypeError::New(env, "Each command must be an object").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        Napi::Object cmdObj = item.As<Napi::Object>();
+        if (!cmdObj.Has("typeId") || !cmdObj.Has("ioa") || !cmdObj.Has("value") || !cmdObj.Has("asduAddress")) {
+            Napi::TypeError::New(env, "Each command must have 'typeId', 'ioa', 'value', 'asduAddress'").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        int typeId = cmdObj.Get("typeId").As<Napi::Number>().Int32Value();
+        int asduAddress = cmdObj.Get("asduAddress").As<Napi::Number>().Int32Value();
+        groupedCommands[{typeId, asduAddress}].push_back(cmdObj);
+    }
 
-    // Проверяем, нет ли уже ожидающей команды для этого клиента (опционально)
+    if (groupedCommands.empty()) {
+        Napi::Error::New(env, "No valid commands").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    // Создаём общий Deferred для всего вызова (Promise.all)
+    auto overallDeferred = Napi::Promise::Deferred::New(env);
+    std::vector<Napi::Promise> groupPromises;
+    std::vector<std::string> groupKeys;
+
+    CS101_AppLayerParameters alParams = CS104_Slave_getAppLayerParameters(server);
+
+    // Для каждой группы создаём свой PendingGroup и отправляем ASDU
+    for (const auto& [key, cmdList] : groupedCommands) {
+        int typeId = key.first;
+        int asduAddress = key.second;
+        std::string groupKey = clientIdStr + ":" + std::to_string(asduAddress) + ":" + std::to_string(typeId);
+
+        // Параметры ASDU (из первой команды)
+        Napi::Object firstCmd = cmdList[0];
+        bool bselCmd = firstCmd.Has("bselCmd") ? firstCmd.Get("bselCmd").As<Napi::Boolean>() : false;
+        int ql = firstCmd.Has("ql") ? firstCmd.Get("ql").As<Napi::Number>().Int32Value() : 0;
+        int cot = firstCmd.Has("cot") ? firstCmd.Get("cot").As<Napi::Number>().Int32Value() : CS101_COT_ACTIVATION;
+        uint8_t quality = firstCmd.Has("quality") ? firstCmd.Get("quality").As<Napi::Number>().Uint32Value() : IEC60870_QUALITY_GOOD;
+
+        if (ql < 0 || ql > 31) {
+            overallDeferred.Reject(Napi::String::New(env, "ql must be 0-31"));
+            return overallDeferred.Promise();
+        }
+
+        // Создаём ASDU
+        CS101_ASDU asdu = CS101_ASDU_create(alParams, false, (CS101_CauseOfTransmission)cot, 0, asduAddress, false, false);
+        bool asduOk = true;
+
+        for (const auto& cmdObj : cmdList) {
+            int ioa = cmdObj.Get("ioa").As<Napi::Number>().Int32Value();
+            InformationObject io = createInformationObject(typeId, ioa, cmdObj, env);
+            if (!io) {
+                CS101_ASDU_destroy(asdu);
+                overallDeferred.Reject(Napi::String::New(env, "Failed to create information object"));
+                return overallDeferred.Promise();
+            }
+            CS101_ASDU_addInformationObject(asdu, io);
+            destroyInformationObject(typeId, io); // ASDU не забирает владение, нужно удалить
+        }
+
+        // Создаём группу ожидания
+        auto pendingGroup = std::make_shared<PendingGroup>(env, 1); // ожидаем одно подтверждение
+        pendingGroup->timeoutMs = timeoutMs;
+
+        {
+            std::lock_guard<std::mutex> lock(pendingGroupsMutex);
+            pendingGroups[groupKey] = pendingGroup;
+        }
+
+        // Запускаем таймер для группы
+        startGroupTimeoutTimer(groupKey, pendingGroup, timeoutMs);
+
+        // Отправляем ASDU
+        bool sent = IMasterConnection_sendASDU(targetConnection, asdu);
+        CS101_ASDU_destroy(asdu);
+
+        if (!sent) {
+            pendingGroup->deferred.Reject(Napi::String::New(env, "Failed to send ASDU"));
+            groupPromises.push_back(pendingGroup->deferred.Promise());
+            groupKeys.push_back(groupKey);
+            continue;
+        }
+
+        groupPromises.push_back(pendingGroup->deferred.Promise());
+        groupKeys.push_back(groupKey);
+    }
+
+    // Возвращаем Promise.all (или обрабатываем по отдельности)
+    // Для простоты возвращаем промис, который разрешается, когда все группы завершены
+    if (groupPromises.empty()) {
+        overallDeferred.Resolve(env.Undefined());
+        return overallDeferred.Promise();
+    }
+
+    // Ждём все промисы групп
+    auto allPromise = Napi::Promise::All(env, groupPromises);
+    allPromise.Then([overallDeferred](const Napi::Value& value) mutable {
+        overallDeferred.Resolve(value);
+    }, [overallDeferred](const Napi::Value& error) mutable {
+        overallDeferred.Reject(error);
+    });
+
+    return overallDeferred.Promise();
+} */
+
+Napi::Value IEC104Server::SendCommandsAsync(const Napi::CallbackInfo& info) {
+    Napi::Env env = info.Env();
+
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsArray()) {
+        Napi::TypeError::New(env, "Expected clientId (string), commands (array)").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::string clientIdStr = info[0].As<Napi::String>().Utf8Value();
+    Napi::Array commands = info[1].As<Napi::Array>();
+    uint64_t timeoutMs = 5000;
+    if (info.Length() >= 3 && info[2].IsNumber()) {
+        timeoutMs = info[2].As<Napi::Number>().Int64Value();
+    }
+
+    // Получаем соединение
+    IMasterConnection targetConnection = nullptr;
     {
-        std::lock_guard<std::mutex> lock(pendingMutex);
-        for (const auto& [k, p] : pendingCommands) {
-            if (k.clientId == clientIdStr) {
-                Napi::Error::New(env, "Another command is pending for this client").ThrowAsJavaScriptException();
-                return env.Undefined();
+        std::lock_guard<std::mutex> lock(connMutex);
+        for (const auto& [conn, id] : clientConnections) {
+            if (id == clientIdStr) {
+                targetConnection = conn;
+                break;
             }
         }
     }
+    if (!targetConnection) {
+        Napi::Error::New(env, "Client not connected").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
 
-    // Создаём Deferred и структуру ожидания
-    auto pending = std::make_shared<PendingCommand>(env);
-    //pending->deferred = Napi::Promise::Deferred::New(env);
-    pending->timeoutMs = timeoutMs;
-    pending->resolved = false;
+    // Проверяем, нет ли уже активного батча для этого клиента
+    {
+        std::lock_guard<std::mutex> lock(clientBatchMutex);
+        if (clientCurrentBatch.find(clientIdStr) != clientCurrentBatch.end()) {
+            Napi::Error::New(env, "Another async command batch is already in progress for this client").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+    }
+
+    // Группировка команд по (typeId, asduAddress)
+    std::map<std::pair<int, int>, std::vector<Napi::Object>> groupedCommands;
+    for (uint32_t i = 0; i < commands.Length(); i++) {
+        Napi::Value item = commands[i];
+        if (!item.IsObject()) {
+            Napi::TypeError::New(env, "Each command must be an object").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        Napi::Object cmdObj = item.As<Napi::Object>();
+        if (!cmdObj.Has("typeId") || !cmdObj.Has("ioa") || !cmdObj.Has("value") || !cmdObj.Has("asduAddress")) {
+            Napi::TypeError::New(env, "Each command must have 'typeId', 'ioa', 'value', 'asduAddress'").ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        int typeId = cmdObj.Get("typeId").As<Napi::Number>().Int32Value();
+        int asduAddress = cmdObj.Get("asduAddress").As<Napi::Number>().Int32Value();
+        groupedCommands[{typeId, asduAddress}].push_back(cmdObj);
+    }
+
+    if (groupedCommands.empty()) {
+        Napi::Error::New(env, "No valid commands").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    CS101_AppLayerParameters alParams = CS104_Slave_getAppLayerParameters(server);
+
+    // Генерируем уникальный ID батча
+    std::string batchId = clientIdStr + "_" + std::to_string(++batchCounter);
+    int expectedConfirmations = groupedCommands.size();
+
+    auto batch = std::make_shared<PendingBatch>(env, expectedConfirmations);
+    batch->timeoutMs = timeoutMs;
 
     {
-        std::lock_guard<std::mutex> lock(pendingMutex);
-        pendingCommands[key] = pending;
+        std::lock_guard<std::mutex> lock(pendingBatchesMutex);
+        pendingBatches[batchId] = batch;
+    }
+    {
+        std::lock_guard<std::mutex> lock(clientBatchMutex);
+        clientCurrentBatch[clientIdStr] = batchId;
     }
 
-    // Запускаем таймер
-    startTimeoutTimer(key, pending, timeoutMs);
+    startBatchTimeoutTimer(batchId, batch, timeoutMs);
 
-    // Создаём ASDU
-    CS101_AppLayerParameters alParams = CS104_Slave_getAppLayerParameters(server);
-    CS101_ASDU asdu = CS101_ASDU_create(alParams, false, CS101_COT_ACTIVATION, 0, asduAddress, false, false);
-    InformationObject io = createInformationObject(typeId, ioa, cmdObj, env);
-    if (!io) {
+    // Отправляем все ASDU
+    bool anyFailed = false;
+    for (const auto& [key, cmdList] : groupedCommands) {
+        int typeId = key.first;
+        int asduAddress = key.second;
+
+        Napi::Object firstCmd = cmdList[0];
+        int cot = firstCmd.Has("cot") ? firstCmd.Get("cot").As<Napi::Number>().Int32Value() : CS101_COT_ACTIVATION;
+
+        CS101_ASDU asdu = CS101_ASDU_create(alParams, false, (CS101_CauseOfTransmission)cot, 0, asduAddress, false, false);
+        bool asduOk = true;
+
+        for (const auto& cmdObj : cmdList) {
+            int ioa = cmdObj.Get("ioa").As<Napi::Number>().Int32Value();
+            InformationObject io = createInformationObject(typeId, ioa, cmdObj, env);
+            if (!io) {
+                CS101_ASDU_destroy(asdu);
+                anyFailed = true;
+                asduOk = false;
+                break;
+            }
+            CS101_ASDU_addInformationObject(asdu, io);
+            destroyInformationObject(typeId, io);
+        }
+
+        if (!asduOk) continue;
+
+        bool sent = IMasterConnection_sendASDU(targetConnection, asdu);
         CS101_ASDU_destroy(asdu);
-        {
-            std::lock_guard<std::mutex> lock(pendingMutex);
-            pendingCommands.erase(key);
+        if (!sent) {
+            anyFailed = true;
+            break;
         }
-        pending->deferred.Reject(Napi::String::New(env, "Failed to create information object"));
-        return pending->deferred.Promise();
     }
 
-    CS101_ASDU_addInformationObject(asdu, io);
-    bool sent = IMasterConnection_sendASDU(targetConnection, asdu);
-    destroyInformationObject(typeId, io);
-    CS101_ASDU_destroy(asdu);
-
-    if (!sent) {
+    if (anyFailed) {
+        // Отменяем батч
+        bool alreadyResolved = false;
         {
-            std::lock_guard<std::mutex> lock(pendingMutex);
-            pendingCommands.erase(key);
+            std::lock_guard<std::mutex> lock(batch->mtx);
+            if (!batch->resolved) {
+                batch->resolved = true;
+            } else {
+                alreadyResolved = true;
+            }
         }
-        pending->deferred.Reject(Napi::String::New(env, "Failed to send ASDU"));
-        return pending->deferred.Promise();
+        if (!alreadyResolved) {
+            std::lock_guard<std::mutex> lock(pendingBatchesMutex);
+            pendingBatches.erase(batchId);
+            std::lock_guard<std::mutex> lock2(clientBatchMutex);
+            clientCurrentBatch.erase(clientIdStr);
+            batch->deferred.Reject(Napi::String::New(env, "Failed to send one or more commands"));
+        }
+        return batch->deferred.Promise();
     }
 
-    return pending->deferred.Promise();
-}          
+    return batch->deferred.Promise();
+}
 
 Napi::Value IEC104Server::GetStatus(const Napi::CallbackInfo& info) {
     Napi::Env env = info.Env();
@@ -1545,7 +1727,7 @@ Napi::Value IEC104Server::GetStatus(const Napi::CallbackInfo& info) {
     return status;
 }
 
-void IEC104Server::startTimeoutTimer(const PendingCommandKey& key, std::shared_ptr<PendingCommand> pending, uint64_t timeoutMs) {
+/*void IEC104Server::startTimeoutTimer(const PendingCommandKey& key, std::shared_ptr<PendingCommand> pending, uint64_t timeoutMs) {
     std::thread([this, key, pending, timeoutMs]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
 
@@ -1570,9 +1752,65 @@ void IEC104Server::startTimeoutTimer(const PendingCommandKey& key, std::shared_p
             });
         }
     }).detach();
+}*/
+
+/*void IEC104Server::startGroupTimeoutTimer(const std::string& groupKey, std::shared_ptr<PendingGroup> pending, uint64_t timeoutMs) {
+    std::thread([this, groupKey, pending, timeoutMs]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
+        bool shouldReject = false;
+        {
+            std::lock_guard<std::mutex> lock(pending->mtx);
+            if (!pending->resolved) {
+                pending->resolved = true;
+                shouldReject = true;
+            }
+        }
+        if (shouldReject) {
+            tsfn.BlockingCall([this, groupKey, pending](Napi::Env env, Napi::Function) {
+                std::lock_guard<std::mutex> lock(pendingGroupsMutex);
+                auto it = pendingGroups.find(groupKey);
+                if (it != pendingGroups.end() && it->second == pending) {
+                    pendingGroups.erase(it);
+                }
+                pending->deferred.Reject(Napi::String::New(env, "Command group timeout"));
+            });
+        }
+    }).detach();
+}*/
+
+void IEC104Server::startBatchTimeoutTimer(const std::string& batchId, std::shared_ptr<PendingBatch> batch, uint64_t timeoutMs) {
+    std::thread([this, batchId, batch, timeoutMs]() {
+        std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
+        bool shouldReject = false;
+        {
+            std::lock_guard<std::mutex> lock(batch->mtx);
+            if (!batch->resolved) {
+                batch->resolved = true;
+                shouldReject = true;
+            }
+        }
+        if (shouldReject) {
+            tsfn.BlockingCall([this, batchId, batch](Napi::Env env, Napi::Function) {
+                std::lock_guard<std::mutex> lock(pendingBatchesMutex);
+                auto it = pendingBatches.find(batchId);
+                if (it != pendingBatches.end() && it->second == batch) {
+                    pendingBatches.erase(it);
+                }
+                // Найти clientId по batchId и удалить
+                std::lock_guard<std::mutex> lock2(clientBatchMutex);
+                for (auto it = clientCurrentBatch.begin(); it != clientCurrentBatch.end(); ++it) {
+                    if (it->second == batchId) {
+                        clientCurrentBatch.erase(it);
+                        break;
+                    }
+                }
+                batch->deferred.Reject(Napi::String::New(env, "Batch timeout"));
+            });
+        }
+    }).detach();
 }
 
-bool IEC104Server::RawMessageHandler(void* parameter, IMasterConnection connection, CS101_ASDU asdu) {
+/*bool IEC104Server::RawMessageHandler(void* parameter, IMasterConnection connection, CS101_ASDU asdu) {
     IEC104Server* server = static_cast<IEC104Server*>(parameter);
     IEC60870_5_TypeID typeID = CS101_ASDU_getTypeID(asdu);
     int numberOfElements = CS101_ASDU_getNumberOfElements(asdu);
@@ -1592,37 +1830,39 @@ bool IEC104Server::RawMessageHandler(void* parameter, IMasterConnection connecti
     // === Обработка подтверждения асинхронных команд ===
     CS101_CauseOfTransmission cot = CS101_ASDU_getCOT(asdu);
     if (cot == CS101_COT_ACTIVATION_CON || cot == CS101_COT_ACTIVATION_TERMINATION) {
-        // Ищем первый IOA (обычно подтверждение содержит тот же IOA)
-        int ioa = -1;
-        if (numberOfElements > 0) {
-            InformationObject io = CS101_ASDU_getElement(asdu, 0);
-            if (io) {
-                ioa = InformationObject_getObjectAddress(io);
-                // Не уничтожаем io, он принадлежит ASDU
+        std::string batchId;
+        {
+            std::lock_guard<std::mutex> lock(server->clientBatchMutex);
+            auto it = server->clientCurrentBatch.find(clientIdStr);
+            if (it != server->clientCurrentBatch.end()) {
+                batchId = it->second;
             }
         }
-        PendingCommandKey key{clientIdStr, ioa, typeID, receivedAsduAddress};
-        std::lock_guard<std::mutex> lock(server->pendingMutex);
-        auto it = server->pendingCommands.find(key);
-        if (it != server->pendingCommands.end()) {
-            auto pending = it->second;
-            bool alreadyResolved = false;
-            {
-                std::lock_guard<std::mutex> lock(pending->mtx);
-                if (!pending->resolved) {
-                    pending->resolved = true;
-                } else {
-                    alreadyResolved = true;
+        if (!batchId.empty()) {
+            std::lock_guard<std::mutex> lock(server->pendingBatchesMutex);
+            auto it = server->pendingBatches.find(batchId);
+            if (it != server->pendingBatches.end()) {
+                auto batch = it->second;
+                bool shouldResolve = false;
+                {
+                    std::lock_guard<std::mutex> lock(batch->mtx);
+                    if (!batch->resolved) {
+                        batch->receivedConfirmations++;
+                        if (batch->receivedConfirmations >= batch->expectedConfirmations) {
+                            batch->resolved = true;
+                            shouldResolve = true;
+                        }
+                    }
+                }
+                if (shouldResolve) {
+                    server->pendingBatches.erase(it);
+                    server->tsfn.BlockingCall([batch](Napi::Env env, Napi::Function) {
+                        batch->deferred.Resolve(env.Undefined());
+                    });
+                    std::lock_guard<std::mutex> lock(server->clientBatchMutex);
+                    server->clientCurrentBatch.erase(clientIdStr);
                 }
             }
-            if (!alreadyResolved) {
-                server->pendingCommands.erase(it);
-                server->tsfn.BlockingCall([pending](Napi::Env env, Napi::Function) {
-                    pending->deferred.Resolve(env.Undefined());
-                });
-            }
-            // Подтверждение обработано. Если ASDU содержит ещё и данные, они будут обработаны ниже.
-            // Но обычно подтверждение не содержит полезной нагрузки.
         }
     }
 
@@ -1952,6 +2192,399 @@ bool IEC104Server::RawMessageHandler(void* parameter, IMasterConnection connecti
         return true;
     } catch (const std::exception& e) {
         // Ошибка обработки ASDU
+        server->tsfn.NonBlockingCall([=](Napi::Env env, Napi::Function jsCallback) {
+            Napi::Object eventObj = Napi::Object::New(env);
+            eventObj.Set("serverID", Napi::String::New(env, server->serverID));
+            eventObj.Set("clientId", Napi::String::New(env, clientIdStr));
+            eventObj.Set("type", Napi::String::New(env, "error"));
+            eventObj.Set("reason", Napi::String::New(env, std::string("ASDU processing failed: ") + e.what()));
+            jsCallback.Call({Napi::String::New(env, "data"), eventObj});
+        });
+        return false;
+    }
+}*/
+
+bool IEC104Server::RawMessageHandler(void* parameter, IMasterConnection connection, CS101_ASDU asdu) {
+    IEC104Server* server = static_cast<IEC104Server*>(parameter);
+    IEC60870_5_TypeID typeID = CS101_ASDU_getTypeID(asdu);
+    int numberOfElements = CS101_ASDU_getNumberOfElements(asdu);
+    int receivedAsduAddress = CS101_ASDU_getCA(asdu);
+    std::string clientIdStr;
+
+    {
+        std::lock_guard<std::mutex> lock(server->connMutex);
+        auto it = server->clientConnections.find(connection);
+        if (it != server->clientConnections.end()) {
+            clientIdStr = it->second;
+        } else {
+            // Неизвестный клиент
+            return false;
+        }
+    }
+
+    // === Обработка подтверждения асинхронных команд ===
+    CS101_CauseOfTransmission cot = CS101_ASDU_getCOT(asdu);
+    if (cot == CS101_COT_ACTIVATION_CON || cot == CS101_COT_ACTIVATION_TERMINATION) {
+        std::string batchId;
+        {
+            std::lock_guard<std::mutex> lock(server->clientBatchMutex);
+            auto it = server->clientCurrentBatch.find(clientIdStr);
+            if (it != server->clientCurrentBatch.end()) {
+                batchId = it->second;
+            }
+        }
+        if (!batchId.empty()) {
+            std::lock_guard<std::mutex> lock(server->pendingBatchesMutex);
+            auto it = server->pendingBatches.find(batchId);
+            if (it != server->pendingBatches.end()) {
+                auto batch = it->second;
+                bool shouldResolve = false;
+                {
+                    std::lock_guard<std::mutex> lock(batch->mtx);
+                    if (!batch->resolved) {
+                        batch->receivedConfirmations++;
+                        if (batch->receivedConfirmations >= batch->expectedConfirmations) {
+                            batch->resolved = true;
+                            shouldResolve = true;
+                        }
+                    }
+                }
+                if (shouldResolve) {
+                    server->pendingBatches.erase(it);
+                    server->tsfn.BlockingCall([batch](Napi::Env env, Napi::Function) {
+                        batch->deferred.Resolve(env.Undefined());
+                    });
+                    std::lock_guard<std::mutex> lock(server->clientBatchMutex);
+                    server->clientCurrentBatch.erase(clientIdStr);
+                }
+            }
+        }
+    }
+
+    // === Обработка входящих команд от клиента ===
+    try {
+        std::vector<std::tuple<int, double, uint8_t, uint64_t, bool, int>> elements;
+
+        switch (typeID) {
+            case C_SC_NA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    SingleCommand io = (SingleCommand)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = SingleCommand_getState(io) ? 1.0 : 0.0;
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = 0;
+                        bool bselCmd = SingleCommand_isSelect(io);
+                        int ql = SingleCommand_getQU(io);
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        SingleCommand_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_DC_NA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    DoubleCommand io = (DoubleCommand)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = static_cast<double>(DoubleCommand_getState(io));
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = 0;
+                        bool bselCmd = DoubleCommand_isSelect(io);
+                        int ql = DoubleCommand_getQU(io);
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        DoubleCommand_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_RC_NA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    StepCommand io = (StepCommand)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = static_cast<double>(StepCommand_getState(io));
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = 0;
+                        bool bselCmd = StepCommand_isSelect(io);
+                        int ql = StepCommand_getQU(io);
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        StepCommand_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_SE_NA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    SetpointCommandNormalized io = (SetpointCommandNormalized)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = SetpointCommandNormalized_getValue(io);
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = 0;
+                        bool bselCmd = SetpointCommandNormalized_isSelect(io);
+                        int ql = SetpointCommandNormalized_getQL(io);
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        SetpointCommandNormalized_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_SE_NB_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    SetpointCommandScaled io = (SetpointCommandScaled)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = SetpointCommandScaled_getValue(io);
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = 0;
+                        bool bselCmd = SetpointCommandScaled_isSelect(io);
+                        int ql = SetpointCommandScaled_getQL(io);
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        SetpointCommandScaled_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_SE_NC_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    SetpointCommandShort io = (SetpointCommandShort)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = SetpointCommandShort_getValue(io);
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = 0;
+                        bool bselCmd = SetpointCommandShort_isSelect(io);
+                        int ql = SetpointCommandShort_getQL(io);
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        SetpointCommandShort_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_BO_NA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    Bitstring32Command io = (Bitstring32Command)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = static_cast<double>(Bitstring32Command_getValue(io));
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = 0;
+                        bool bselCmd = false;
+                        int ql = 0;
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        Bitstring32Command_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_SC_TA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    SingleCommandWithCP56Time2a io = (SingleCommandWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = SingleCommand_getState((SingleCommand)io) ? 1.0 : 0.0;
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = CP56Time2a_toMsTimestamp(SingleCommandWithCP56Time2a_getTimestamp(io));
+                        bool bselCmd = SingleCommand_isSelect((SingleCommand)io);
+                        int ql = SingleCommand_getQU((SingleCommand)io);
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        SingleCommandWithCP56Time2a_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_DC_TA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    DoubleCommandWithCP56Time2a io = (DoubleCommandWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = static_cast<double>(DoubleCommand_getState((DoubleCommand)io));
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = CP56Time2a_toMsTimestamp(DoubleCommandWithCP56Time2a_getTimestamp(io));
+                        bool bselCmd = DoubleCommand_isSelect((DoubleCommand)io);
+                        int ql = DoubleCommand_getQU((DoubleCommand)io);
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        DoubleCommandWithCP56Time2a_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_RC_TA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    StepCommandWithCP56Time2a io = (StepCommandWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = static_cast<double>(StepCommand_getState((StepCommand)io));
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = CP56Time2a_toMsTimestamp(StepCommandWithCP56Time2a_getTimestamp(io));
+                        bool bselCmd = StepCommand_isSelect((StepCommand)io);
+                        int ql = StepCommand_getQU((StepCommand)io);
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        StepCommandWithCP56Time2a_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_SE_TA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    SetpointCommandNormalizedWithCP56Time2a io = (SetpointCommandNormalizedWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = SetpointCommandNormalized_getValue((SetpointCommandNormalized)io);
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = CP56Time2a_toMsTimestamp(SetpointCommandNormalizedWithCP56Time2a_getTimestamp(io));
+                        bool bselCmd = SetpointCommandNormalized_isSelect((SetpointCommandNormalized)io);
+                        int ql = SetpointCommandNormalized_getQL((SetpointCommandNormalized)io);
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        SetpointCommandNormalizedWithCP56Time2a_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_SE_TB_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    SetpointCommandScaledWithCP56Time2a io = (SetpointCommandScaledWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = SetpointCommandScaled_getValue((SetpointCommandScaled)io);
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = CP56Time2a_toMsTimestamp(SetpointCommandScaledWithCP56Time2a_getTimestamp(io));
+                        bool bselCmd = SetpointCommandScaled_isSelect((SetpointCommandScaled)io);
+                        int ql = SetpointCommandScaled_getQL((SetpointCommandScaled)io);
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        SetpointCommandScaledWithCP56Time2a_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_SE_TC_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    SetpointCommandShortWithCP56Time2a io = (SetpointCommandShortWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = SetpointCommandShort_getValue((SetpointCommandShort)io);
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = CP56Time2a_toMsTimestamp(SetpointCommandShortWithCP56Time2a_getTimestamp(io));
+                        bool bselCmd = SetpointCommandShort_isSelect((SetpointCommandShort)io);
+                        int ql = SetpointCommandShort_getQL((SetpointCommandShort)io);
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        SetpointCommandShortWithCP56Time2a_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_BO_TA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    Bitstring32CommandWithCP56Time2a io = (Bitstring32CommandWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = static_cast<double>(Bitstring32Command_getValue((Bitstring32Command)io));
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = CP56Time2a_toMsTimestamp(Bitstring32CommandWithCP56Time2a_getTimestamp(io));
+                        bool bselCmd = false;
+                        int ql = 0;
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        Bitstring32CommandWithCP56Time2a_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_IC_NA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    InterrogationCommand io = (InterrogationCommand)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = InterrogationCommand_getQOI(io);
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = 0;
+                        bool bselCmd = false;
+                        int ql = 0;
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        InterrogationCommand_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_CI_NA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    CounterInterrogationCommand io = (CounterInterrogationCommand)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = CounterInterrogationCommand_getQCC(io);
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = 0;
+                        bool bselCmd = false;
+                        int ql = 0;
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        CounterInterrogationCommand_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_RD_NA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    ReadCommand io = (ReadCommand)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = 0;
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = 0;
+                        bool bselCmd = false;
+                        int ql = 0;
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        ReadCommand_destroy(io);
+                    }
+                }
+                break;
+            }
+            case C_CS_NA_1: {
+                for (int i = 0; i < numberOfElements; i++) {
+                    ClockSynchronizationCommand io = (ClockSynchronizationCommand)CS101_ASDU_getElement(asdu, i);
+                    if (io) {
+                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
+                        double val = 0;
+                        uint8_t quality = IEC60870_QUALITY_GOOD;
+                        uint64_t timestamp = CP56Time2a_toMsTimestamp(ClockSynchronizationCommand_getTime(io));
+                        bool bselCmd = false;
+                        int ql = 0;
+                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
+                        ClockSynchronizationCommand_destroy(io);
+                    }
+                }
+                break;
+            }
+            default:
+                // Неподдерживаемый тип ASDU
+                return false;
+        }
+
+        // Отправка данных в JavaScript через ThreadSafeFunction
+        server->tsfn.NonBlockingCall([=](Napi::Env env, Napi::Function jsCallback) {
+            Napi::Array jsArray = Napi::Array::New(env, elements.size());
+            for (size_t i = 0; i < elements.size(); i++) {
+                const auto& [ioa, val, quality, timestamp, bselCmd, ql] = elements[i];
+                Napi::Object msg = Napi::Object::New(env);
+                msg.Set("serverID", Napi::String::New(env, server->serverID));
+                msg.Set("clientId", Napi::String::New(env, clientIdStr));
+                msg.Set("typeId", Napi::Number::New(env, typeID));
+                msg.Set("asduAddress", Napi::Number::New(env, receivedAsduAddress));
+                msg.Set("ioa", Napi::Number::New(env, ioa));
+                msg.Set("val", Napi::Number::New(env, val));
+                msg.Set("quality", Napi::Number::New(env, quality));
+                msg.Set("bselCmd", Napi::Boolean::New(env, bselCmd));
+                msg.Set("ql", Napi::Number::New(env, ql));
+                if (timestamp > 0) {
+                    msg.Set("timestamp", Napi::Number::New(env, static_cast<double>(timestamp)));
+                }
+                jsArray[i] = msg;
+            }
+            jsCallback.Call({Napi::String::New(env, "data"), jsArray});
+            server->cnt++;
+        });
+
+        return true;
+    } catch (const std::exception& e) {
         server->tsfn.NonBlockingCall([=](Napi::Env env, Napi::Function jsCallback) {
             Napi::Object eventObj = Napi::Object::New(env);
             eventObj.Set("serverID", Napi::String::New(env, server->serverID));
