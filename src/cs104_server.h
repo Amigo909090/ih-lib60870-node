@@ -50,7 +50,7 @@ public:
 
 private:
     // Структура для хранения Deferred и таймера
-    struct PendingCommand {
+    /*struct PendingCommand {
         Napi::Promise::Deferred deferred;
         std::unique_ptr<std::thread> timerThread;
         std::atomic<bool> resolved{false};
@@ -62,6 +62,20 @@ private:
             : deferred(Napi::Promise::Deferred::New(env)), timeoutMs(0) {}
 
         // Запрещаем копирование, разрешаем перемещение
+        PendingCommand(const PendingCommand&) = delete;
+        PendingCommand& operator=(const PendingCommand&) = delete;
+        PendingCommand(PendingCommand&&) = default;
+        PendingCommand& operator=(PendingCommand&&) = default;
+    };*/
+    struct PendingCommand {
+        Napi::Promise::Deferred deferred;
+        std::atomic<bool> resolved{false};
+        std::mutex mtx;
+        uint64_t timeoutMs;
+
+        explicit PendingCommand(Napi::Env env)
+            : deferred(Napi::Promise::Deferred::New(env)), resolved(false), timeoutMs(0) {}
+
         PendingCommand(const PendingCommand&) = delete;
         PendingCommand& operator=(const PendingCommand&) = delete;
         PendingCommand(PendingCommand&&) = default;

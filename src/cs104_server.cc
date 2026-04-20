@@ -29,6 +29,7 @@ Napi::Object IEC104Server::Init(Napi::Env env, Napi::Object exports) {
         InstanceMethod("start", &IEC104Server::Start),
         InstanceMethod("stop", &IEC104Server::Stop),
         InstanceMethod("sendCommands", &IEC104Server::SendCommands),
+        InstanceMethod("sendCommandAsync", &IEC104Server::SendCommandAsync),
         InstanceMethod("getStatus", &IEC104Server::GetStatus)
     });
 
@@ -1482,7 +1483,7 @@ Napi::Value IEC104Server::SendCommandAsync(const Napi::CallbackInfo& info) {
 
     // Создаём Deferred и структуру ожидания
     auto pending = std::make_shared<PendingCommand>(env);
-    pending->deferred = Napi::Promise::Deferred::New(env);
+    //pending->deferred = Napi::Promise::Deferred::New(env);
     pending->timeoutMs = timeoutMs;
     pending->resolved = false;
 
@@ -1545,391 +1546,31 @@ Napi::Value IEC104Server::GetStatus(const Napi::CallbackInfo& info) {
 }
 
 void IEC104Server::startTimeoutTimer(const PendingCommandKey& key, std::shared_ptr<PendingCommand> pending, uint64_t timeoutMs) {
-    // Запускаем таймер в отдельном потоке
     std::thread([this, key, pending, timeoutMs]() {
         std::this_thread::sleep_for(std::chrono::milliseconds(timeoutMs));
-        std::lock_guard<std::mutex> lock(pendingMutex);
-        auto it = pendingCommands.find(key);
-        if (it != pendingCommands.end() && it->second == pending) {
-            bool alreadyResolved = false;
-            {
-                std::lock_guard<std::mutex> lock(pending->mtx);
-                if (!pending->resolved) {
-                    pending->resolved = true;
-                } else {
-                    alreadyResolved = true;
+
+        bool shouldReject = false;
+        {
+            std::lock_guard<std::mutex> lock(pending->mtx);
+            if (!pending->resolved) {
+                pending->resolved = true;
+                shouldReject = true;
+            }
+        }
+
+        if (shouldReject) {
+            // Удаляем из map в основном потоке через tsfn
+            tsfn.BlockingCall([this, key, pending](Napi::Env env, Napi::Function) {
+                std::lock_guard<std::mutex> lock(pendingMutex);
+                auto it = pendingCommands.find(key);
+                if (it != pendingCommands.end() && it->second == pending) {
+                    pendingCommands.erase(it);
                 }
-            }
-            if (!alreadyResolved) {
-                pendingCommands.erase(it);
-                pending->deferred.Reject(Napi::String::New(pending->deferred.Env(), "Command timeout"));
-            }
+                pending->deferred.Reject(Napi::String::New(env, "Command timeout"));
+            });
         }
     }).detach();
 }
-
-/*bool IEC104Server::RawMessageHandler(void* parameter, IMasterConnection connection, CS101_ASDU asdu) {
-    IEC104Server* server = static_cast<IEC104Server*>(parameter);
-    IEC60870_5_TypeID typeID = CS101_ASDU_getTypeID(asdu);
-    int numberOfElements = CS101_ASDU_getNumberOfElements(asdu);
-    int receivedAsduAddress = CS101_ASDU_getCA(asdu);
-    std::string clientIdStr;
-
-    {
-        std::lock_guard<std::mutex> lock(server->connMutex);
-        if (server->clientConnections.find(connection) != server->clientConnections.end()) {
-            clientIdStr = server->clientConnections[connection];
-        } else {
-           // printf("Received message from unknown client, serverID: %s\n", server->serverID.c_str());
-            fflush(stdout);
-            return false;
-        }
-    }
-
-    try {
-        vector<tuple<int, double, uint8_t, uint64_t, bool, int>> elements;
-
-        switch (typeID) {
-            case C_SC_NA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    SingleCommand io = (SingleCommand)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = SingleCommand_getState(io) ? 1.0 : 0.0;
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = 0;
-                        bool bselCmd = SingleCommand_isSelect(io);
-                        int ql = SingleCommand_getQU(io);
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        SingleCommand_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_DC_NA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    DoubleCommand io = (DoubleCommand)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = static_cast<double>(DoubleCommand_getState(io));
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = 0;
-                        bool bselCmd = DoubleCommand_isSelect(io);
-                        int ql = DoubleCommand_getQU(io);
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        DoubleCommand_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_RC_NA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    StepCommand io = (StepCommand)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = static_cast<double>(StepCommand_getState(io));
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = 0;
-                        bool bselCmd = StepCommand_isSelect(io);
-                        int ql = StepCommand_getQU(io);
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        StepCommand_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_SE_NA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    SetpointCommandNormalized io = (SetpointCommandNormalized)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = SetpointCommandNormalized_getValue(io);
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = 0;
-                        bool bselCmd = SetpointCommandNormalized_isSelect(io);
-                        int ql = SetpointCommandNormalized_getQL(io);
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        SetpointCommandNormalized_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_SE_NB_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    SetpointCommandScaled io = (SetpointCommandScaled)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = SetpointCommandScaled_getValue(io);
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = 0;
-                        bool bselCmd = SetpointCommandScaled_isSelect(io);
-                        int ql = SetpointCommandScaled_getQL(io);
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        SetpointCommandScaled_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_SE_NC_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    SetpointCommandShort io = (SetpointCommandShort)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = SetpointCommandShort_getValue(io);
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = 0;
-                        bool bselCmd = SetpointCommandShort_isSelect(io);
-                        int ql = SetpointCommandShort_getQL(io);
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        SetpointCommandShort_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_BO_NA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    Bitstring32Command io = (Bitstring32Command)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = static_cast<double>(Bitstring32Command_getValue(io));
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = 0;
-                        bool bselCmd = false;
-                        int ql = 0;
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        Bitstring32Command_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_SC_TA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    SingleCommandWithCP56Time2a io = (SingleCommandWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = SingleCommand_getState((SingleCommand)io) ? 1.0 : 0.0;
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = CP56Time2a_toMsTimestamp(SingleCommandWithCP56Time2a_getTimestamp(io));
-                        bool bselCmd = SingleCommand_isSelect((SingleCommand)io);
-                        int ql = SingleCommand_getQU((SingleCommand)io);
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        SingleCommandWithCP56Time2a_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_DC_TA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    DoubleCommandWithCP56Time2a io = (DoubleCommandWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = static_cast<double>(DoubleCommand_getState((DoubleCommand)io));
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = CP56Time2a_toMsTimestamp(DoubleCommandWithCP56Time2a_getTimestamp(io));
-                        bool bselCmd = DoubleCommand_isSelect((DoubleCommand)io);
-                        int ql = DoubleCommand_getQU((DoubleCommand)io);
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        DoubleCommandWithCP56Time2a_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_RC_TA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    StepCommandWithCP56Time2a io = (StepCommandWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = static_cast<double>(StepCommand_getState((StepCommand)io));
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = CP56Time2a_toMsTimestamp(StepCommandWithCP56Time2a_getTimestamp(io));
-                        bool bselCmd = StepCommand_isSelect((StepCommand)io);
-                        int ql = StepCommand_getQU((StepCommand)io);
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        StepCommandWithCP56Time2a_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_SE_TA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    SetpointCommandNormalizedWithCP56Time2a io = (SetpointCommandNormalizedWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = SetpointCommandNormalized_getValue((SetpointCommandNormalized)io);
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = CP56Time2a_toMsTimestamp(SetpointCommandNormalizedWithCP56Time2a_getTimestamp(io));
-                        bool bselCmd = SetpointCommandNormalized_isSelect((SetpointCommandNormalized)io);
-                        int ql = SetpointCommandNormalized_getQL((SetpointCommandNormalized)io);
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        SetpointCommandNormalizedWithCP56Time2a_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_SE_TB_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    SetpointCommandScaledWithCP56Time2a io = (SetpointCommandScaledWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = SetpointCommandScaled_getValue((SetpointCommandScaled)io);
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = CP56Time2a_toMsTimestamp(SetpointCommandScaledWithCP56Time2a_getTimestamp(io));
-                        bool bselCmd = SetpointCommandScaled_isSelect((SetpointCommandScaled)io);
-                        int ql = SetpointCommandScaled_getQL((SetpointCommandScaled)io);
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        SetpointCommandScaledWithCP56Time2a_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_SE_TC_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    SetpointCommandShortWithCP56Time2a io = (SetpointCommandShortWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = SetpointCommandShort_getValue((SetpointCommandShort)io);
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = CP56Time2a_toMsTimestamp(SetpointCommandShortWithCP56Time2a_getTimestamp(io));
-                        bool bselCmd = SetpointCommandShort_isSelect((SetpointCommandShort)io);
-                        int ql = SetpointCommandShort_getQL((SetpointCommandShort)io);
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        SetpointCommandShortWithCP56Time2a_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_BO_TA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    Bitstring32CommandWithCP56Time2a io = (Bitstring32CommandWithCP56Time2a)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = static_cast<double>(Bitstring32Command_getValue((Bitstring32Command)io));
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = CP56Time2a_toMsTimestamp(Bitstring32CommandWithCP56Time2a_getTimestamp(io));
-                        bool bselCmd = false;
-                        int ql = 0;
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        Bitstring32CommandWithCP56Time2a_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_IC_NA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    InterrogationCommand io = (InterrogationCommand)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = InterrogationCommand_getQOI(io);
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = 0;
-                        bool bselCmd = false;
-                        int ql = 0;
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        InterrogationCommand_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_CI_NA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    CounterInterrogationCommand io = (CounterInterrogationCommand)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = CounterInterrogationCommand_getQCC(io);
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = 0;
-                        bool bselCmd = false;
-                        int ql = 0;
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        CounterInterrogationCommand_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_RD_NA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    ReadCommand io = (ReadCommand)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = 0;
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = 0;
-                        bool bselCmd = false;
-                        int ql = 0;
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        ReadCommand_destroy(io);
-                    }
-                }
-                break;
-            }
-            case C_CS_NA_1: {
-                for (int i = 0; i < numberOfElements; i++) {
-                    ClockSynchronizationCommand io = (ClockSynchronizationCommand)CS101_ASDU_getElement(asdu, i);
-                    if (io) {
-                        int ioa = InformationObject_getObjectAddress((InformationObject)io);
-                        double val = 0;
-                        uint8_t quality = IEC60870_QUALITY_GOOD;
-                        uint64_t timestamp = CP56Time2a_toMsTimestamp(ClockSynchronizationCommand_getTime(io));
-                        bool bselCmd = false;
-                        int ql = 0;
-                        elements.emplace_back(ioa, val, quality, timestamp, bselCmd, ql);
-                        ClockSynchronizationCommand_destroy(io);
-                    }
-                }
-                break;
-            }
-           default:
-                // printf("Received unsupported ASDU type: %s (%i), serverID: %s, clientId: %s, asduAddress: %d\n",
-                //        TypeID_toString(typeID), typeID, server->serverID.c_str(), clientIdStr.c_str(), receivedAsduAddress);
-                fflush(stdout);
-                return false;
-        }
-      
-     for (const auto& [ioa, val, quality, timestamp, bselCmd, ql] : elements) {
-            // printf("ASDU type: %s, serverID: %s, clientId: %s, asduAddress: %d, ioa: %i, value: %f, quality: %u, timestamp: %" PRIu64 ", bselCmd: %d, ql: %d, cnt: %i\n",
-            //        TypeID_toString(typeID), server->serverID.c_str(), clientIdStr.c_str(), receivedAsduAddress, ioa, val, quality, timestamp, bselCmd, ql, server->cnt);
-            fflush(stdout);
-        }
-
-        server->tsfn.NonBlockingCall([=](Napi::Env env, Napi::Function jsCallback) {
-            Napi::Array jsArray = Napi::Array::New(env, elements.size());
-            for (size_t i = 0; i < elements.size(); i++) {
-                const auto& [ioa, val, quality, timestamp, bselCmd, ql] = elements[i];
-                Napi::Object msg = Napi::Object::New(env);
-                msg.Set("serverID", Napi::String::New(env, server->serverID));               
-                msg.Set("clientId", Napi::String::New(env, clientIdStr));
-                msg.Set("typeId", Napi::Number::New(env, typeID));
-                msg.Set("asduAddress", Napi::Number::New(env, receivedAsduAddress));
-                msg.Set("ioa", Napi::Number::New(env, ioa));
-                msg.Set("val", Napi::Number::New(env, val));
-                msg.Set("quality", Napi::Number::New(env, quality));
-                msg.Set("bselCmd", Napi::Boolean::New(env, bselCmd));
-                msg.Set("ql", Napi::Number::New(env, ql));
-                if (timestamp > 0) {
-                    msg.Set("timestamp", Napi::Number::New(env, static_cast<double>(timestamp)));
-                }
-                jsArray[i] = msg;
-            }
-            jsCallback.Call({Napi::String::New(env, "data"), jsArray});
-            server->cnt++;
-        });
-
-        return true;
-    } catch (const std::exception& e) {
-        // printf("Exception in RawMessageHandler: %s, serverID: %s, clientId: %s, asduAddress: %d\n",
-        //        e.what(), server->serverID.c_str(), clientIdStr.c_str(), receivedAsduAddress);
-        fflush(stdout);
-        server->tsfn.NonBlockingCall([=](Napi::Env env, Napi::Function jsCallback) {
-            Napi::Object eventObj = Napi::Object::New(env);
-            eventObj.Set("serverID", Napi::String::New(env, server->serverID));
-            eventObj.Set("clientId", Napi::String::New(env, clientIdStr));
-            eventObj.Set("type", Napi::String::New(env, "error"));
-            eventObj.Set("reason", Napi::String::New(env, string("Обработка ASDU не удалась: ") + e.what()));
-            jsCallback.Call({Napi::String::New(env, "data"), eventObj});
-        });
-        return false;
-    }
-}*/
 
 bool IEC104Server::RawMessageHandler(void* parameter, IMasterConnection connection, CS101_ASDU asdu) {
     IEC104Server* server = static_cast<IEC104Server*>(parameter);
