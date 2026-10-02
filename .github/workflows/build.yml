@@ -61,7 +61,7 @@ jobs:
       matrix:
         os:
           - ubuntu-22.04
-          - windows-latest
+          - windows-2022
           - macos-latest
         arch:
           - x64
@@ -104,7 +104,7 @@ jobs:
         run: npm install
 
       - name: Configure build for Unix
-        if: matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-2022'
         run: |
           if [ "${{ matrix.os }}" == "ubuntu-22.04" ] && [ "${{ matrix.arch }}" == "arm" ]; then
             export CC=arm-linux-gnueabihf-gcc
@@ -124,12 +124,12 @@ jobs:
         shell: bash
 
       - name: Configure build for Windows
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-2022'
         run: npm run configure
         shell: pwsh
 
       - name: Determine output directory (Unix)
-        if: matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-2022'
         id: set-output-dir-unix
         run: |
           if [ "${{ matrix.os }}" == "macos-latest" ] && [ "${{ matrix.arch }}" == "x64" ]; then
@@ -146,7 +146,7 @@ jobs:
         shell: bash
 
       - name: Determine output directory (Windows)
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-2022'
         id: set-output-dir-windows
         run: |
           if ("${{ matrix.arch }}" -eq "x64") {
@@ -169,7 +169,7 @@ jobs:
         shell: bash
 
       - name: Prebuild binaries for Node.js 20
-        if: matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-2022'
         run: |
           if [ "${{ matrix.os }}" == "macos-latest" ] && [ "${{ matrix.arch }}" == "x64" ]; then
             arch -x86_64 npm run prebuild -- --arch x64 --macos-min-version=11.0
@@ -189,7 +189,7 @@ jobs:
         shell: bash
 
       - name: Prebuild binaries for Node.js 20 (Windows)
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-2022'
         run: |
           npm run prebuild -- --arch x64
         shell: pwsh
@@ -200,7 +200,7 @@ jobs:
         shell: bash
 
       - name: Determine platform for artifact name (Unix)
-        if: matrix.os != 'windows-latest'
+        if: matrix.os != 'windows-2022'
         id: determine-platform-unix
         run: |
           if [ "${{ matrix.os }}" == "ubuntu-22.04" ]; then
@@ -211,10 +211,10 @@ jobs:
         shell: bash
 
       - name: Determine platform for artifact name (Windows)
-        if: matrix.os == 'windows-latest'
+        if: matrix.os == 'windows-2022'
         id: determine-platform-windows
         run: |
-          if ("${{ matrix.os }}" -eq "windows-latest") {
+          if ("${{ matrix.os }}" -eq "windows-2022") {
             echo "platform=win32" >> $env:GITHUB_OUTPUT
           }
         shell: pwsh
