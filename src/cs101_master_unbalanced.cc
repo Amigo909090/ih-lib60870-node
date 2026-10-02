@@ -79,6 +79,7 @@ IEC101MasterUnbalanced::IEC101MasterUnbalanced(const CallbackInfo &info) : Objec
     }
 }
 
+
 IEC101MasterUnbalanced::~IEC101MasterUnbalanced() {
     std::lock_guard<std::mutex> lock(connMutex);
     if (running) {
