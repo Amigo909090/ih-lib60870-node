@@ -27,8 +27,6 @@ extern "C" {
 using namespace Napi;
 using namespace std;
 
-
-
 FunctionReference IEC101MasterUnbalanced::constructor;
 
 Object IEC101MasterUnbalanced::Init(Napi::Env env, Object exports) {
@@ -86,7 +84,7 @@ IEC101MasterUnbalanced::~IEC101MasterUnbalanced() {
     if (running) {
         running = false;
         if (connected) {
-            //printf("Destructor closing connection, clientID: %s\n", clientID.c_str());
+            printf("Destructor closing connection, clientID: %s\n", clientID.c_str());
             CS101_Master_stop(master);
             CS101_Master_destroy(master);
             SerialPort_destroy(serialPort);

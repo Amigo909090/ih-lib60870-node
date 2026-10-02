@@ -10,6 +10,7 @@ const CFG = {
     clientID: 'cs101_master_1',
     linkAddress: 3,
 
+    
     slaveAddresses: [1, 2],
 
     // Размеры полей ASDU (под ваши устройства)
