@@ -6,7 +6,7 @@ on:
   pull_request:
     branches: [main]
   workflow_dispatch:
-  
+
 jobs:
   create-release:
     runs-on: ubuntu-latest
@@ -337,7 +337,7 @@ jobs:
           fi
         shell: bash
 
-            - name: Publish to npm
+      - name: Publish to npm
         run: |
           git config --global user.name "GitHub Actions"
           git config --global user.email "actions@github.com"
